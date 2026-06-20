@@ -169,7 +169,7 @@ function s3ListObjectsXml(bucket, files, folders, prefix, delimiter) {
   let xml = '<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>';
   xml += '<Name>' + escXml(bucket) + '</Name><Prefix>' + escXml(prefix || '') + '</Prefix><Delimiter>' + escXml(delimiter || '') + '</Delimiter><KeyCount>' + (files.length + folders.length) + '</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>';
   for (const f of folders) {
-    xml += '<CommonPrefixes><Prefix>' + escXml(f.path) + '/</Prefix></CommonPrefixes>';
+    xml += '<CommonPrefixes><Prefix>' + escXml(f.path.replace(/^\//, '')) + '/</Prefix></CommonPrefixes>';
   }
   for (const f of files) {
     const key = (f.folder === '/' ? '' : f.folder.replace(/^\//, '') + '/') + f.original_name;
@@ -304,18 +304,57 @@ app.get('/:bucket', (req, res, next) => {
 
   const prefix = req.query.prefix || '';
   const delimiter = req.query.delimiter || '';
-  const folder = '/' + prefix;
+  const folder = '/' + prefix.replace(/\/$/, '');
 
   const files = dbAll("SELECT id, original_name, size, folder, created_at FROM files WHERE bucket = ? AND folder = ? AND original_name LIKE ? ORDER BY original_name",
     [req.params.bucket, folder, '%']);
 
-  const allFolders = dbAll("SELECT path, name FROM folders WHERE bucket = ? AND path LIKE ? AND path != '/' ORDER BY path", [req.params.bucket, folder + '%']);
+  let allFolders = dbAll("SELECT path, name FROM folders WHERE bucket = ? AND path LIKE ? AND path != '/' ORDER BY path", [req.params.bucket, folder + '%']);
 
-  const subFolders = allFolders.filter(f => {
-    const rel = f.path.replace(/^\/+/, '');
-    return rel.startsWith(prefix);
-  });
+  const fileFolders = dbAll("SELECT DISTINCT folder FROM files WHERE bucket = ? AND folder != ? AND folder LIKE ?", [req.params.bucket, folder, folder + '%']);
+  for (const row of fileFolders) {
+    const relPath = row.folder.replace(/^\/+/, '');
+    if (relPath.startsWith(prefix)) {
+      const name = row.folder.split('/').filter(Boolean).pop() || '';
+      const existing = allFolders.some(f => f.path === row.folder);
+      if (!existing) {
+        allFolders.push({ path: row.folder, name });
+        dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)',
+          [genId(), req.params.bucket, row.folder, name]);
+      }
+    }
+  }
 
+  let subFolders;
+  if (delimiter) {
+    const seen = new Set();
+    subFolders = [];
+    for (const f of allFolders) {
+      const rel = f.path.replace(/^\/+/, '');
+      if (!rel.startsWith(prefix)) continue;
+      const suffix = rel.slice(prefix.length);
+      const idx = suffix.indexOf('/');
+      if (idx !== -1) {
+        const childPrefix = prefix + suffix.slice(0, idx + 1);
+        if (!seen.has(childPrefix)) {
+          seen.add(childPrefix);
+          subFolders.push({ path: '/' + childPrefix.replace(/\/$/, ''), name: suffix.slice(0, idx) });
+        }
+      } else if (suffix) {
+        if (!seen.has(rel + '/')) {
+          seen.add(rel + '/');
+          subFolders.push({ path: f.path, name: f.name });
+        }
+      }
+    }
+  } else {
+    subFolders = allFolders.filter(f => {
+      const rel = f.path.replace(/^\/+/, '');
+      return rel.startsWith(prefix);
+    });
+  }
+
+  saveDb();
   res.type('application/xml').send(s3ListObjectsXml(req.params.bucket, files, subFolders, prefix, delimiter));
 });
 
@@ -395,6 +434,16 @@ app.put('/:bucket/*', (req, res, next) => {
   const mime = req.headers['content-type'] || 'application/octet-stream';
   dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [id, req.params.bucket, storedName, name, targetPath, bodyBuffer.length, mime, folder]);
+
+  if (folder !== '/') {
+    const parts = folder.split('/').filter(Boolean);
+    let currentPath = '';
+    for (const part of parts) {
+      currentPath += '/' + part;
+      dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)',
+        [genId(), req.params.bucket, currentPath, part]);
+    }
+  }
   saveDb();
 
   res.setHeader('ETag', '"' + sha256(id).slice(0, 16) + '"');
@@ -529,12 +578,32 @@ app.get('/api/files/:bucket', (req, res) => {
   if (!b) return res.status(404).json({ error: 'Bucket not found' });
 
   const files = dbAll('SELECT id, original_name, size, mime_type, folder, created_at FROM files WHERE bucket = ? AND folder = ? ORDER BY original_name', [bucket, folder]);
-  const allFolders = dbAll('SELECT id, path, name, created_at FROM folders WHERE bucket = ? AND path != ? AND path LIKE ? ORDER BY name', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
+  let allFolders = dbAll('SELECT id, path, name, created_at FROM folders WHERE bucket = ? AND path != ? AND path LIKE ? ORDER BY name', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
+
+  const fileFolders = dbAll('SELECT DISTINCT folder FROM files WHERE bucket = ? AND folder != ? AND folder LIKE ?', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
+  for (const row of fileFolders) {
+    const rel = row.folder.replace(folder, '').replace(/^\//, '');
+    if (rel && !rel.includes('/')) {
+      const existing = allFolders.some(f => f.path === row.folder);
+      if (!existing) {
+        allFolders.push({
+          id: genId(),
+          path: row.folder,
+          name: rel,
+          created_at: null,
+        });
+        dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)',
+          [genId(), bucket, row.folder, rel]);
+      }
+    }
+  }
+
   const immediate = allFolders.filter(f => {
     const rel = f.path.replace(folder, '').replace(/^\//, '');
     return !rel.includes('/');
   });
   res.json({ files, folders: immediate, folder, bucket });
+  saveDb();
 });
 
 app.post('/api/upload/:bucket', upload.single('file'), (req, res) => {
