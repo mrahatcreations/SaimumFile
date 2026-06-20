@@ -1,0 +1,13 @@
+services:
+  saimum-file:
+    build: .
+    ports:
+      - "8335:8335"
+    environment:
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - JWT_SECRET=${JWT_SECRET}
+      - PORT=8335
+    volumes:
+      - /data/saimumfile:/data
+    restart: unless-stopped
