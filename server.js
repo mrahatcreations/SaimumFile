@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const initSqlJs = require('sql.js');
+const Database = require('better-sqlite3');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
@@ -17,27 +17,20 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 let db;
 
 function dbGet(sql, params = []) {
-  const stmt = db.prepare(sql);
-  if (params.length) stmt.bind(params);
-  if (stmt.step()) { const r = stmt.getAsObject(); stmt.free(); return r; }
-  stmt.free(); return null;
+  return db.prepare(sql).get(...params);
 }
 
 function dbAll(sql, params = []) {
-  const stmt = db.prepare(sql);
-  if (params.length) stmt.bind(params);
-  const rows = [];
-  while (stmt.step()) rows.push(stmt.getAsObject());
-  stmt.free();
-  return rows;
+  return db.prepare(sql).all(...params);
 }
 
 function dbRun(sql, params = []) {
-  db.run(sql, params);
+  db.prepare(sql).run(...params);
 }
 
 function dbCount(sql, params = []) {
@@ -46,29 +39,15 @@ function dbCount(sql, params = []) {
 }
 
 async function initDb() {
-  const SQL = await initSqlJs();
-  if (fs.existsSync(DB_PATH)) {
-    const buf = fs.readFileSync(DB_PATH);
-    db = new SQL.Database(buf);
-  } else {
-    db = new SQL.Database();
-  }
-  db.run('PRAGMA journal_mode=WAL');
-  db.run(`CREATE TABLE IF NOT EXISTS buckets (id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, label TEXT DEFAULT '', access_key TEXT UNIQUE NOT NULL, secret_key TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, name TEXT NOT NULL, original_name TEXT NOT NULL, storage_path TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mime_type TEXT DEFAULT 'application/octet-stream', folder TEXT NOT NULL DEFAULT '/', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`);
-  db.run(`CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(bucket, path))`);
-  saveDb();
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.prepare(`CREATE TABLE IF NOT EXISTS buckets (id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, label TEXT DEFAULT '', access_key TEXT UNIQUE NOT NULL, secret_key TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
+  db.prepare(`CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, name TEXT NOT NULL, original_name TEXT NOT NULL, storage_path TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mime_type TEXT DEFAULT 'application/octet-stream', folder TEXT NOT NULL DEFAULT '/', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
+  db.prepare(`CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(bucket, path))`).run();
 }
 
-let saveDbTimer = null;
 function saveDb() {
-  if (saveDbTimer) clearTimeout(saveDbTimer);
-  saveDbTimer = setTimeout(() => {
-    const data = db.export();
-    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-    fs.writeFileSync(DB_PATH, Buffer.from(data));
-    saveDbTimer = null;
-  }, 1000);
+  // No-op. better-sqlite3 writes to disk immediately.
 }
 
 function genId() { return crypto.randomUUID(); }
@@ -412,7 +391,7 @@ app.head('/:bucket/*', (req, res, next) => {
   res.status(200).end();
 });
 
-app.put('/:bucket/*', (req, res, next) => {
+app.put('/:bucket/*', async (req, res, next) => {
   if (!req.isS3) return next();
   const b = dbGet('SELECT * FROM buckets WHERE name = ? AND access_key = ?', [req.params.bucket, req.s3Bucket.access_key]);
   if (!b) return res.status(404).type('application/xml').send(s3XmlError('NoSuchBucket', 'The specified bucket does not exist'));
@@ -429,7 +408,7 @@ app.put('/:bucket/*', (req, res, next) => {
   const targetPath = path.join(targetDir, storedName);
 
   let bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
-  fs.writeFileSync(targetPath, bodyBuffer);
+  await fs.promises.writeFile(targetPath, bodyBuffer);
 
   const mime = req.headers['content-type'] || 'application/octet-stream';
   dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -444,13 +423,12 @@ app.put('/:bucket/*', (req, res, next) => {
         [genId(), req.params.bucket, currentPath, part]);
     }
   }
-  saveDb();
 
   res.setHeader('ETag', '"' + sha256(id).slice(0, 16) + '"');
   res.status(200).type('application/xml').send('<?xml version="1.0" encoding="UTF-8"?><PutObjectResult><ETag>"' + sha256(id).slice(0, 16) + '"</ETag></PutObjectResult>');
 });
 
-app.delete('/:bucket/*', (req, res, next) => {
+app.delete('/:bucket/*', async (req, res, next) => {
   if (!req.isS3) return next();
   const key = req.params[0];
   const name = path.basename(key);
@@ -460,9 +438,8 @@ app.delete('/:bucket/*', (req, res, next) => {
     [req.params.bucket, name, folder]);
   if (!row) return res.status(204).end();
 
-  if (fs.existsSync(row.storage_path)) fs.unlinkSync(row.storage_path);
+  if (fs.existsSync(row.storage_path)) await fs.promises.unlink(row.storage_path).catch(() => {});
   dbRun('DELETE FROM files WHERE id = ?', [row.id]);
-  saveDb();
   res.status(204).end();
 });
 
@@ -606,14 +583,14 @@ app.get('/api/files/:bucket', (req, res) => {
   saveDb();
 });
 
-app.post('/api/upload/:bucket', upload.single('file'), (req, res) => {
+app.post('/api/upload/:bucket', upload.single('file'), async (req, res) => {
   const { bucket } = req.params;
   const file = req.file;
   const folder = sanitizeFolder(req.body.folder || '/');
   const b = dbGet('SELECT * FROM buckets WHERE name = ?', [bucket]);
   
   if (!b) {
-    if (file) fs.unlinkSync(file.path);
+    if (file) await fs.promises.unlink(file.path).catch(() => {});
     return res.status(404).json({ error: 'Bucket not found' });
   }
   if (!file) return res.status(400).json({ error: 'No file' });
@@ -623,8 +600,8 @@ app.post('/api/upload/:bucket', upload.single('file'), (req, res) => {
   const storedName = id + ext;
   const targetDir = resolveFolderPath(bucket, folder);
   const targetPath = path.join(targetDir, storedName);
-  fs.copyFileSync(file.path, targetPath);
-  fs.unlinkSync(file.path);
+  await fs.promises.copyFile(file.path, targetPath);
+  await fs.promises.unlink(file.path).catch(() => {});
 
   dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [id, bucket, storedName, file.originalname, targetPath, file.size, file.mimetype, folder]);
@@ -632,7 +609,6 @@ app.post('/api/upload/:bucket', upload.single('file'), (req, res) => {
     const fpath = folder.startsWith('/') ? folder : '/' + folder;
     dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)', [genId(), bucket, fpath, path.basename(fpath)]);
   }
-  saveDb();
   res.json({ id, name: file.originalname, size: file.size, folder, bucket });
 });
 
@@ -646,17 +622,16 @@ app.get('/api/download/:bucket/:id', (req, res) => {
   res.sendFile(row.storage_path);
 });
 
-app.delete('/api/files/:bucket/:id', (req, res) => {
+app.delete('/api/files/:bucket/:id', async (req, res) => {
   const { bucket, id } = req.params;
   const row = dbGet('SELECT * FROM files WHERE id = ? AND bucket = ?', [id, bucket]);
   if (!row) return res.status(404).json({ error: 'File not found' });
-  if (fs.existsSync(row.storage_path)) fs.unlinkSync(row.storage_path);
+  if (fs.existsSync(row.storage_path)) await fs.promises.unlink(row.storage_path).catch(() => {});
   dbRun('DELETE FROM files WHERE id = ?', [id]);
-  saveDb();
   res.json({ ok: true });
 });
 
-app.patch('/api/files/:bucket/:id/rename', (req, res) => {
+app.patch('/api/files/:bucket/:id/rename', async (req, res) => {
   const { bucket, id } = req.params;
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'New name required' });
@@ -665,9 +640,8 @@ app.patch('/api/files/:bucket/:id/rename', (req, res) => {
   const ext = path.extname(row.storage_path);
   const newStoredName = genId() + ext;
   const newPath = path.join(path.dirname(row.storage_path), newStoredName);
-  fs.renameSync(row.storage_path, newPath);
+  await fs.promises.rename(row.storage_path, newPath).catch(() => {});
   dbRun("UPDATE files SET original_name = ?, name = ?, storage_path = ?, updated_at = datetime('now') WHERE id = ?", [name, newStoredName, newPath, id]);
-  saveDb();
   res.json({ ok: true, name });
 });
 
@@ -684,7 +658,7 @@ app.post('/api/folders/:bucket', (req, res) => {
   res.json({ folder, ok: true });
 });
 
-app.delete('/api/folders/:bucket', (req, res) => {
+app.delete('/api/folders/:bucket', async (req, res) => {
   const { bucket } = req.params;
   const folder = sanitizeFolder(req.body.folder);
   if (folder === '/') return res.status(400).json({ error: 'Cannot delete root' });
@@ -693,14 +667,121 @@ app.delete('/api/folders/:bucket', (req, res) => {
 
   const files = dbAll('SELECT * FROM files WHERE bucket = ? AND (folder = ? OR folder LIKE ?)', [bucket, folder, folder + '/%']);
   for (const f of files) {
-    if (fs.existsSync(f.storage_path)) fs.unlinkSync(f.storage_path);
+    if (fs.existsSync(f.storage_path)) await fs.promises.unlink(f.storage_path).catch(() => {});
   }
   dbRun('DELETE FROM files WHERE bucket = ? AND (folder = ? OR folder LIKE ?)', [bucket, folder, folder + '/%']);
   dbRun('DELETE FROM folders WHERE bucket = ? AND (path = ? OR path LIKE ?)', [bucket, folder, folder + '/%']);
-  saveDb();
   const target = path.join(resolveBucketPath(bucket), folder === '/' ? '' : folder);
-  if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+  if (fs.existsSync(target)) await fs.promises.rm(target, { recursive: true, force: true }).catch(() => {});
   res.json({ ok: true });
+});
+
+app.post('/api/folders/move', async (req, res) => {
+  const { source_bucket, target_bucket, source_folder, target_folder } = req.body;
+  if (!source_bucket || !target_bucket || !source_folder) return res.status(400).json({ error: 'Missing required parameters' });
+  
+  const srcF = sanitizeFolder(source_folder);
+  if (srcF === '/') return res.status(400).json({ error: 'Cannot move root folder' });
+  const tgtF = sanitizeFolder(target_folder || '/');
+
+  const bSrc = dbGet('SELECT * FROM buckets WHERE name = ?', [source_bucket]);
+  const bTgt = dbGet('SELECT * FROM buckets WHERE name = ?', [target_bucket]);
+  if (!bSrc || !bTgt) return res.status(404).json({ error: 'Source or target bucket not found' });
+
+  const srcName = path.basename(srcF);
+  const newRootFolder = tgtF === '/' ? '/' + srcName : tgtF + '/' + srcName;
+
+  // Move files
+  const files = dbAll('SELECT * FROM files WHERE bucket = ? AND (folder = ? OR folder LIKE ?)', [source_bucket, srcF, srcF + '/%']);
+  for (const f of files) {
+    const relFolder = f.folder === srcF ? '' : f.folder.slice(srcF.length);
+    const newFolder = newRootFolder + relFolder;
+    
+    const targetDir = resolveFolderPath(target_bucket, newFolder);
+    const newPath = path.join(targetDir, f.name);
+    
+    if (fs.existsSync(f.storage_path)) {
+      await fs.promises.rename(f.storage_path, newPath).catch(() => {});
+    }
+    
+    dbRun("UPDATE files SET bucket = ?, folder = ?, storage_path = ?, updated_at = datetime('now') WHERE id = ?", [target_bucket, newFolder, newPath, f.id]);
+  }
+
+  // Handle folders
+  const folders = dbAll('SELECT * FROM folders WHERE bucket = ? AND (path = ? OR path LIKE ?)', [source_bucket, srcF, srcF + '/%']);
+  for (const fd of folders) {
+    const relPath = fd.path === srcF ? '' : fd.path.slice(srcF.length);
+    const newPath = newRootFolder + relPath;
+    
+    resolveFolderPath(target_bucket, newPath);
+    
+    const existing = dbGet('SELECT id FROM folders WHERE bucket = ? AND path = ?', [target_bucket, newPath]);
+    if (existing) {
+      dbRun('DELETE FROM folders WHERE id = ?', [fd.id]);
+    } else {
+      dbRun('UPDATE folders SET bucket = ?, path = ? WHERE id = ?', [target_bucket, newPath, fd.id]);
+    }
+  }
+
+  const oldTarget = path.join(resolveBucketPath(source_bucket), srcF);
+  if (fs.existsSync(oldTarget)) {
+    await fs.promises.rm(oldTarget, { recursive: true, force: true }).catch(() => {});
+  }
+
+  res.json({ ok: true, moved_files: files.length, new_folder: newRootFolder });
+});
+
+app.post('/api/folders/copy', async (req, res) => {
+  const { source_bucket, target_bucket, source_folder, target_folder } = req.body;
+  if (!source_bucket || !target_bucket || !source_folder) return res.status(400).json({ error: 'Missing required parameters' });
+  
+  const srcF = sanitizeFolder(source_folder);
+  if (srcF === '/') return res.status(400).json({ error: 'Cannot copy root folder' });
+  const tgtF = sanitizeFolder(target_folder || '/');
+
+  const bSrc = dbGet('SELECT * FROM buckets WHERE name = ?', [source_bucket]);
+  const bTgt = dbGet('SELECT * FROM buckets WHERE name = ?', [target_bucket]);
+  if (!bSrc || !bTgt) return res.status(404).json({ error: 'Source or target bucket not found' });
+
+  const srcName = path.basename(srcF);
+  const newRootFolder = tgtF === '/' ? '/' + srcName : tgtF + '/' + srcName;
+
+  // Copy files
+  const files = dbAll('SELECT * FROM files WHERE bucket = ? AND (folder = ? OR folder LIKE ?)', [source_bucket, srcF, srcF + '/%']);
+  for (const f of files) {
+    const relFolder = f.folder === srcF ? '' : f.folder.slice(srcF.length);
+    const newFolder = newRootFolder + relFolder;
+    
+    const targetDir = resolveFolderPath(target_bucket, newFolder);
+    
+    const newId = genId();
+    const ext = path.extname(f.name);
+    const newStoredName = newId + ext;
+    const newPath = path.join(targetDir, newStoredName);
+    
+    if (fs.existsSync(f.storage_path)) {
+      await fs.promises.copyFile(f.storage_path, newPath).catch(() => {});
+    }
+    
+    dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [newId, target_bucket, newStoredName, f.original_name, newPath, f.size, f.mime_type, newFolder]);
+  }
+
+  // Handle folders
+  const folders = dbAll('SELECT * FROM folders WHERE bucket = ? AND (path = ? OR path LIKE ?)', [source_bucket, srcF, srcF + '/%']);
+  for (const fd of folders) {
+    const relPath = fd.path === srcF ? '' : fd.path.slice(srcF.length);
+    const newPath = newRootFolder + relPath;
+    
+    resolveFolderPath(target_bucket, newPath);
+    
+    const existing = dbGet('SELECT id FROM folders WHERE bucket = ? AND path = ?', [target_bucket, newPath]);
+    if (!existing) {
+      dbRun('INSERT INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)', [genId(), target_bucket, newPath, path.basename(newPath)]);
+    }
+  }
+
+  res.json({ ok: true, copied_files: files.length, new_folder: newRootFolder });
 });
 
 /* Stats */
@@ -748,7 +829,7 @@ app.get('/api/external/:bucket/files', bucketAuth, (req, res) => {
   res.json({ files, folder });
 });
 
-app.post('/api/external/:bucket/upload', bucketAuth, upload.single('file'), (req, res) => {
+app.post('/api/external/:bucket/upload', bucketAuth, upload.single('file'), async (req, res) => {
   const file = req.file;
   const folder = sanitizeFolder(req.body.folder || '/');
   if (!file) return res.status(400).json({ error: 'No file' });
@@ -757,11 +838,10 @@ app.post('/api/external/:bucket/upload', bucketAuth, upload.single('file'), (req
   const storedName = id + ext;
   const targetDir = resolveFolderPath(req.bucket.name, folder);
   const targetPath = path.join(targetDir, storedName);
-  fs.copyFileSync(file.path, targetPath);
-  fs.unlinkSync(file.path);
+  await fs.promises.copyFile(file.path, targetPath);
+  await fs.promises.unlink(file.path).catch(() => {});
   dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [id, req.bucket.name, storedName, file.originalname, targetPath, file.size, file.mimetype, folder]);
-  saveDb();
   res.json({ id, name: file.originalname, size: file.size, folder });
 });
 
@@ -774,38 +854,37 @@ app.get('/api/external/:bucket/download/:id', bucketAuth, (req, res) => {
   res.sendFile(row.storage_path);
 });
 
-app.delete('/api/external/:bucket/files/:id', bucketAuth, (req, res) => {
+app.delete('/api/external/:bucket/files/:id', bucketAuth, async (req, res) => {
   const row = dbGet('SELECT * FROM files WHERE id = ? AND bucket = ?', [req.params.id, req.bucket.name]);
   if (!row) return res.status(404).json({ error: 'File not found' });
-  if (fs.existsSync(row.storage_path)) fs.unlinkSync(row.storage_path);
+  if (fs.existsSync(row.storage_path)) await fs.promises.unlink(row.storage_path).catch(() => {});
   dbRun('DELETE FROM files WHERE id = ?', [req.params.id]);
-  saveDb();
   res.json({ ok: true });
 });
 
 /* Backup and Restore */
-app.get('/api/backup', (req, res) => {
+app.get('/api/backup', async (req, res) => {
   const tempDir = path.join('/tmp', 'saimum-backup-' + Date.now());
   fs.mkdirSync(tempDir, { recursive: true });
-  fs.copyFileSync(DB_PATH, path.join(tempDir, 'saimum.db'));
+  await fs.promises.copyFile(DB_PATH, path.join(tempDir, 'saimum.db'));
   
   const cp = require('child_process');
   try {
     cp.execSync(`cp -r ${STORAGE_PATH} ${path.join(tempDir, 'files')}`);
     const backupFile = path.join('/tmp', `saimum-backup-${Date.now()}.tar.gz`);
     cp.execSync(`tar -czf ${backupFile} -C ${tempDir} .`);
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     
-    res.download(backupFile, `saimumfile-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`, (err) => {
-      if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
+    res.download(backupFile, `saimumfile-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`, async (err) => {
+      if (fs.existsSync(backupFile)) await fs.promises.unlink(backupFile).catch(() => {});
     });
   } catch (err) {
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     res.status(500).json({ error: 'Failed to create backup: ' + err.message });
   }
 });
 
-app.post('/api/restore', upload.single('file'), (req, res) => {
+app.post('/api/restore', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No backup file uploaded' });
   const backupFile = req.file.path;
   const tempExtractDir = path.join('/tmp', 'saimum-restore-' + Date.now());
@@ -825,21 +904,73 @@ app.post('/api/restore', upload.single('file'), (req, res) => {
       db.close();
     }
 
-    fs.copyFileSync(restoredDb, DB_PATH);
-    fs.rmSync(STORAGE_PATH, { recursive: true, force: true });
+    await fs.promises.copyFile(restoredDb, DB_PATH);
+    await fs.promises.rm(STORAGE_PATH, { recursive: true, force: true }).catch(() => {});
     cp.execSync(`cp -r ${restoredFiles} ${STORAGE_PATH}`);
 
-    initDb().then(() => {
-      fs.rmSync(tempExtractDir, { recursive: true, force: true });
-      if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
+    initDb().then(async () => {
+      await fs.promises.rm(tempExtractDir, { recursive: true, force: true }).catch(() => {});
+      if (fs.existsSync(backupFile)) await fs.promises.unlink(backupFile).catch(() => {});
       res.json({ ok: true });
     }).catch(err => {
       res.status(500).json({ error: 'Failed to re-initialize DB after restore: ' + err.message });
     });
   } catch (err) {
-    fs.rmSync(tempExtractDir, { recursive: true, force: true });
-    if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
+    await fs.promises.rm(tempExtractDir, { recursive: true, force: true }).catch(() => {});
+    if (fs.existsSync(backupFile)) await fs.promises.unlink(backupFile).catch(() => {});
     res.status(500).json({ error: err.message || 'Failed to restore backup' });
+  }
+});
+
+/* Sync manually added files */
+app.post('/api/sync', async (req, res) => {
+  try {
+    let syncedFiles = 0;
+    const buckets = dbAll('SELECT name FROM buckets');
+    
+    const scanDir = async (bucket, dirPath, relFolder) => {
+      let count = 0;
+      if (!fs.existsSync(dirPath)) return count;
+      const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          const newRelFolder = relFolder === '/' ? '/' + entry.name : relFolder + '/' + entry.name;
+          dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)', [genId(), bucket, newRelFolder, entry.name]);
+          count += await scanDir(bucket, fullPath, newRelFolder);
+        } else if (entry.isFile()) {
+          const existing = dbGet('SELECT id FROM files WHERE storage_path = ?', [fullPath]);
+          if (!existing) {
+            const stat = await fs.promises.stat(fullPath);
+            const id = genId();
+            let mimeType = 'application/octet-stream';
+            // simple common mimetypes
+            const ext = path.extname(entry.name).toLowerCase();
+            if (['.jpg','.jpeg'].includes(ext)) mimeType = 'image/jpeg';
+            else if (ext === '.png') mimeType = 'image/png';
+            else if (ext === '.gif') mimeType = 'image/gif';
+            else if (ext === '.pdf') mimeType = 'application/pdf';
+            else if (ext === '.txt') mimeType = 'text/plain';
+            else if (ext === '.mp4') mimeType = 'video/mp4';
+            else if (ext === '.mp3') mimeType = 'audio/mpeg';
+
+            dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [id, bucket, entry.name, entry.name, fullPath, stat.size, mimeType, relFolder]);
+            count++;
+          }
+        }
+      }
+      return count;
+    };
+
+    for (const b of buckets) {
+      const bPath = path.join(STORAGE_PATH, b.name);
+      syncedFiles += await scanDir(b.name, bPath, '/');
+    }
+    
+    res.json({ ok: true, synced_files: syncedFiles });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
