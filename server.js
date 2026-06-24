@@ -547,6 +547,57 @@ app.delete('/api/buckets/:name', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/buckets/:name/sync', async (req, res) => {
+  const { name } = req.params;
+  const bucket = dbGet('SELECT * FROM buckets WHERE name = ?', [name]);
+  if (!bucket) return res.status(404).json({ error: 'Bucket not found' });
+
+  const bucketPath = resolveBucketPath(name);
+  if (!fs.existsSync(bucketPath)) {
+    return res.json({ ok: true, synced_files: 0, new_folders: 0 });
+  }
+
+  let syncedFiles = 0;
+  let newFolders = 0;
+
+  async function walkDir(dir, folderPath) {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const subFolder = (folderPath === '/' ? '/' : folderPath + '/') + entry.name;
+        const existingFolder = dbGet('SELECT id FROM folders WHERE bucket = ? AND path = ?', [name, subFolder]);
+        if (!existingFolder) {
+          dbRun('INSERT INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)', [genId(), name, subFolder, entry.name]);
+          newFolders++;
+        }
+        await walkDir(fullPath, subFolder);
+      } else {
+        const existingFile = dbGet('SELECT id FROM files WHERE bucket = ? AND storage_path = ?', [name, fullPath]);
+        if (!existingFile) {
+          const stats = await fs.promises.stat(fullPath);
+          const id = genId();
+          const ext = path.extname(entry.name).toLowerCase();
+          const mimeMap = {'.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.pdf':'application/pdf', '.txt':'text/plain'};
+          const finalMime = mimeMap[ext] || 'application/octet-stream';
+
+          dbRun('INSERT INTO files (id, bucket, name, original_name, storage_path, size, mime_type, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [id, name, entry.name, entry.name, fullPath, stats.size, finalMime, folderPath]);
+          syncedFiles++;
+        }
+      }
+    }
+  }
+
+  try {
+    await walkDir(bucketPath, '/');
+    saveDb();
+    res.json({ ok: true, synced_files: syncedFiles, new_folders: newFolders });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* Files */
 app.get('/api/files/:bucket', (req, res) => {
   const { bucket } = req.params;

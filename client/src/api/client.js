@@ -156,3 +156,9 @@ export async function regenerateBucketKeys(name) {
   return r.json()
 }
 
+export async function syncBucket(name) {
+  const r = await authFetch(API + '/buckets/' + name + '/sync', {
+    method: 'POST',
+  })
+  return r.json()
+}

@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   getFiles, uploadFile, downloadFile, deleteFile, renameFile,
   createFolder, deleteFolder, getDisk, getBucketKeys, updateBucketLabel, getBucketStats, deleteBucket,
-  downloadBackup, restoreBackup, regenerateBucketKeys
+  downloadBackup, restoreBackup, regenerateBucketKeys, syncBucket
 } from '../api/client'
 import Toast from '../components/Toast'
 import FileIcon from '../components/FileIcon'
@@ -205,6 +205,19 @@ export default function Browser() {
       access_key: d.access_key,
       secret_key: d.secret_key
     })
+  }
+
+  async function handleSyncBucket() {
+    setLoading(true)
+    try {
+      const d = await syncBucket(bucket)
+      if (d.error) setToast({ msg: d.error, type: 'error' })
+      else setToast({ msg: `Synced ${d.synced_files} files and ${d.new_folders} folders`, type: 'success' })
+      await loadFiles()
+    } catch (err) {
+      setToast({ msg: err.message || 'Sync failed', type: 'error' })
+      setLoading(false)
+    }
   }
 
   async function handleBackupDownload() {
@@ -599,6 +612,15 @@ export default function Browser() {
                 >
                   <Icon name="plus" size={14} strokeWidth={2.5} />
                   New Folder
+                </button>
+
+                <button
+                  onClick={handleSyncBucket}
+                  className="px-3.5 py-1.5 text-xs font-semibold text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"
+                  title="Scan bucket folder and sync files to database"
+                >
+                  <Icon name="refresh-cw" size={14} strokeWidth={2.5} />
+                  Sync Bucket
                 </button>
               </div>
 
