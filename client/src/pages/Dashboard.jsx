@@ -250,20 +250,6 @@ export default function Dashboard() {
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between mb-6">
-              <div>
-                <h2 className="text-xl font-bold text-gray-800 dark:text-gray-100 tracking-tight" style={{ fontFamily: "'Product Sans', 'Google Sans', Arial" }}>Buckets</h2>
-                <p className="text-xs text-gray-450 dark:text-gray-500 mt-0.5">Manage S3-compatible cloud storage buckets</p>
-              </div>
-              <button
-                onClick={() => setShowModal(true)}
-                className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-900 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-white px-5 py-2.5 rounded-2xl text-sm font-medium transition-all shadow-[0_1px_2px_rgba(0,0,0,0.05)] hover:shadow-md hover:shadow-zinc-805/10 cursor-pointer"
-              >
-                <Icon name="plus" size={16} strokeWidth={2.5} />
-                New Bucket
-              </button>
-            </div>
-
             {/* Stats Summary Grid */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
               <div className="bg-white dark:bg-[#131314] rounded-2xl border border-gray-200/60 dark:border-gray-800/70 p-4.5">
@@ -294,6 +280,20 @@ export default function Dashboard() {
                   <p className="text-base font-bold text-gray-400 mt-1">N/A</p>
                 )}
               </div>
+            </div>
+
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-xl font-bold text-gray-800 dark:text-gray-100 tracking-tight" style={{ fontFamily: "'Product Sans', 'Google Sans', Arial" }}>Buckets</h2>
+                <p className="text-xs text-gray-450 dark:text-gray-500 mt-0.5">Manage S3-compatible cloud storage buckets</p>
+              </div>
+              <button
+                onClick={() => setShowModal(true)}
+                className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-900 dark:bg-zinc-700 dark:hover:bg-zinc-600 text-white px-5 py-2.5 rounded-2xl text-sm font-medium transition-all shadow-[0_1px_2px_rgba(0,0,0,0.05)] hover:shadow-md hover:shadow-zinc-805/10 cursor-pointer"
+              >
+                <Icon name="plus" size={16} strokeWidth={2.5} />
+                New Bucket
+              </button>
             </div>
 
             {buckets.length === 0 ? (

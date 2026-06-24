@@ -8,6 +8,37 @@ const Database = require('better-sqlite3');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
+const { createClient } = require('redis');
+
+const redisClient = createClient({ url: process.env.REDIS_URL || 'redis://redis:6379' });
+redisClient.on('error', err => console.error('Redis Client Error', err));
+redisClient.connect().catch(console.error);
+
+async function getFolderSize(bucket, path) {
+  const cacheKey = `folder_size:${bucket}:${path}`;
+  try {
+    const cached = await redisClient.get(cacheKey);
+    if (cached) return parseInt(cached, 10);
+  } catch (err) { console.error(err); }
+  
+  const filesSize = dbGet('SELECT COALESCE(SUM(size), 0) as s FROM files WHERE bucket = ? AND (folder = ? OR folder LIKE ?)', [bucket, path, path === '/' ? '/%' : path + '/%']);
+  const size = filesSize ? filesSize.s : 0;
+  
+  try {
+    await redisClient.setEx(cacheKey, 60, size.toString()); // 1 minute cache
+  } catch (err) {}
+  
+  return size;
+}
+
+async function invalidateCache(bucket) {
+  try {
+    const keys = await redisClient.keys(`folder_size:${bucket}:*`);
+    if (keys.length > 0) await redisClient.del(keys);
+    await redisClient.del('global_stats');
+  } catch (err) {}
+}
+
 const app = express();
 const PORT = process.env.PORT || 8335;
 const STORAGE_PATH = process.env.STORAGE_PATH || '/data/files';
@@ -592,6 +623,7 @@ app.post('/api/buckets/:name/sync', async (req, res) => {
   try {
     await walkDir(bucketPath, '/');
     saveDb();
+    await invalidateCache(name);
     res.json({ ok: true, synced_files: syncedFiles, new_folders: newFolders });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -599,39 +631,58 @@ app.post('/api/buckets/:name/sync', async (req, res) => {
 });
 
 /* Files */
-app.get('/api/files/:bucket', (req, res) => {
+app.get('/api/files/:bucket', async (req, res) => {
   const { bucket } = req.params;
   const folder = sanitizeFolder(req.query.folder);
+  const limit = parseInt(req.query.limit) || 0;
+  const offset = parseInt(req.query.offset) || 0;
+  
   const b = dbGet('SELECT * FROM buckets WHERE name = ?', [bucket]);
   if (!b) return res.status(404).json({ error: 'Bucket not found' });
 
-  const files = dbAll('SELECT id, original_name, size, mime_type, folder, created_at FROM files WHERE bucket = ? AND folder = ? ORDER BY original_name', [bucket, folder]);
-  let allFolders = dbAll('SELECT id, path, name, created_at FROM folders WHERE bucket = ? AND path != ? AND path LIKE ? ORDER BY name', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
+  let filesQuery = 'SELECT id, original_name, size, mime_type, folder, created_at FROM files WHERE bucket = ? AND folder = ? ORDER BY original_name';
+  let filesParams = [bucket, folder];
+  if (limit > 0) {
+    filesQuery += ' LIMIT ? OFFSET ?';
+    filesParams.push(limit, offset);
+  }
+  const files = dbAll(filesQuery, filesParams);
+  const totalFiles = dbGet('SELECT COUNT(id) as c FROM files WHERE bucket = ? AND folder = ?', [bucket, folder]).c;
 
-  const fileFolders = dbAll('SELECT DISTINCT folder FROM files WHERE bucket = ? AND folder != ? AND folder LIKE ?', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
-  for (const row of fileFolders) {
-    const rel = row.folder.replace(folder, '').replace(/^\//, '');
-    if (rel && !rel.includes('/')) {
-      const existing = allFolders.some(f => f.path === row.folder);
-      if (!existing) {
-        allFolders.push({
-          id: genId(),
-          path: row.folder,
-          name: rel,
-          created_at: null,
-        });
-        dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)',
-          [genId(), bucket, row.folder, rel]);
+  let immediate = [];
+  if (offset === 0) {
+    let allFolders = dbAll('SELECT id, path, name, created_at FROM folders WHERE bucket = ? AND path != ? AND path LIKE ? ORDER BY name', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
+
+    const fileFolders = dbAll('SELECT DISTINCT folder FROM files WHERE bucket = ? AND folder != ? AND folder LIKE ?', [bucket, folder, folder === '/' ? '/%' : folder + '/%']);
+    for (const row of fileFolders) {
+      const rel = row.folder.replace(folder, '').replace(/^\//, '');
+      if (rel && !rel.includes('/')) {
+        const existing = allFolders.some(f => f.path === row.folder);
+        if (!existing) {
+          allFolders.push({
+            id: genId(),
+            path: row.folder,
+            name: rel,
+            created_at: null,
+          });
+          dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)',
+            [genId(), bucket, row.folder, rel]);
+        }
       }
     }
+
+    immediate = allFolders.filter(f => {
+      const rel = f.path.replace(folder, '').replace(/^\//, '');
+      return !rel.includes('/');
+    });
+
+    for (const f of immediate) {
+      f.size = await getFolderSize(bucket, f.path);
+    }
+    saveDb();
   }
 
-  const immediate = allFolders.filter(f => {
-    const rel = f.path.replace(folder, '').replace(/^\//, '');
-    return !rel.includes('/');
-  });
-  res.json({ files, folders: immediate, folder, bucket });
-  saveDb();
+  res.json({ files, totalFiles, folders: immediate, folder, bucket });
 });
 
 app.post('/api/upload/:bucket', upload.single('file'), async (req, res) => {
@@ -660,6 +711,7 @@ app.post('/api/upload/:bucket', upload.single('file'), async (req, res) => {
     const fpath = folder.startsWith('/') ? folder : '/' + folder;
     dbRun('INSERT OR IGNORE INTO folders (id, bucket, path, name) VALUES (?, ?, ?, ?)', [genId(), bucket, fpath, path.basename(fpath)]);
   }
+  await invalidateCache(bucket);
   res.json({ id, name: file.originalname, size: file.size, folder, bucket });
 });
 
@@ -679,6 +731,7 @@ app.delete('/api/files/:bucket/:id', async (req, res) => {
   if (!row) return res.status(404).json({ error: 'File not found' });
   if (fs.existsSync(row.storage_path)) await fs.promises.unlink(row.storage_path).catch(() => {});
   dbRun('DELETE FROM files WHERE id = ?', [id]);
+  await invalidateCache(bucket);
   res.json({ ok: true });
 });
 
@@ -693,6 +746,7 @@ app.patch('/api/files/:bucket/:id/rename', async (req, res) => {
   const newPath = path.join(path.dirname(row.storage_path), newStoredName);
   await fs.promises.rename(row.storage_path, newPath).catch(() => {});
   dbRun("UPDATE files SET original_name = ?, name = ?, storage_path = ?, updated_at = datetime('now') WHERE id = ?", [name, newStoredName, newPath, id]);
+  await invalidateCache(bucket);
   res.json({ ok: true, name });
 });
 
@@ -724,6 +778,7 @@ app.delete('/api/folders/:bucket', async (req, res) => {
   dbRun('DELETE FROM folders WHERE bucket = ? AND (path = ? OR path LIKE ?)', [bucket, folder, folder + '/%']);
   const target = path.join(resolveBucketPath(bucket), folder === '/' ? '' : folder);
   if (fs.existsSync(target)) await fs.promises.rm(target, { recursive: true, force: true }).catch(() => {});
+  await invalidateCache(bucket);
   res.json({ ok: true });
 });
 
@@ -778,6 +833,8 @@ app.post('/api/folders/move', async (req, res) => {
   if (fs.existsSync(oldTarget)) {
     await fs.promises.rm(oldTarget, { recursive: true, force: true }).catch(() => {});
   }
+  await invalidateCache(source_bucket);
+  await invalidateCache(target_bucket);
 
   res.json({ ok: true, moved_files: files.length, new_folder: newRootFolder });
 });
@@ -832,17 +889,30 @@ app.post('/api/folders/copy', async (req, res) => {
     }
   }
 
+  await invalidateCache(source_bucket);
+  await invalidateCache(target_bucket);
+
   res.json({ ok: true, copied_files: files.length, new_folder: newRootFolder });
 });
 
-/* Stats */
-app.get('/api/stats', (req, res) => {
-  res.json({
+app.get('/api/stats', async (req, res) => {
+  try {
+    const cached = await redisClient.get('global_stats');
+    if (cached) return res.json(JSON.parse(cached));
+  } catch(e){}
+
+  const stats = {
     buckets: dbCount('SELECT COUNT(*) as c FROM buckets'),
     files: dbCount('SELECT COUNT(*) as c FROM files'),
     size: dbCount('SELECT COALESCE(SUM(size), 0) as s FROM files'),
     folders: dbCount('SELECT COUNT(*) as c FROM folders'),
-  });
+  };
+
+  try {
+    await redisClient.setEx('global_stats', 60, JSON.stringify(stats));
+  } catch(e){}
+
+  res.json(stats);
 });
 
 app.get('/api/disk', (req, res) => {

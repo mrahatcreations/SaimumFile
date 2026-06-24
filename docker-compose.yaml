@@ -8,6 +8,15 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
       - JWT_SECRET=${JWT_SECRET}
       - PORT=8335
+      - REDIS_URL=redis://redis:6379
     volumes:
       - /data/saimumfile:/data
     restart: unless-stopped
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - /data/saimum-redis:/data

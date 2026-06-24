@@ -53,8 +53,8 @@ export async function deleteBucket(name) {
   return r.json()
 }
 
-export async function getFiles(bucket, folder = '/') {
-  const r = await authFetch(API + '/files/' + bucket + '?folder=' + encodeURIComponent(folder))
+export async function getFiles(bucket, folder = '/', limit = 0, offset = 0) {
+  const r = await authFetch(API + '/files/' + bucket + '?folder=' + encodeURIComponent(folder) + '&limit=' + limit + '&offset=' + offset)
   return r.json()
 }
 

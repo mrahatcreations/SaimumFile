@@ -83,6 +83,9 @@ export default function Browser() {
   const [folders, setFolders] = useState([])
   const [folderPath, setFolderPath] = useState('/')
   const [loading, setLoading] = useState(true)
+  const [offset, setOffset] = useState(0)
+  const [hasMore, setHasMore] = useState(true)
+  const observerTarget = useRef(null)
   const [toast, setToast] = useState(null)
   const [showFolderModal, setShowFolderModal] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
@@ -150,9 +153,24 @@ export default function Browser() {
 
   useEffect(() => {
     if (sidebarActive === 'drive') {
-      loadFiles()
+      loadFiles(true)
     }
   }, [folderPath])
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries[0].isIntersecting && hasMore && !loading) {
+          loadFiles(false)
+        }
+      },
+      { threshold: 1.0 }
+    )
+    if (observerTarget.current) observer.observe(observerTarget.current)
+    return () => {
+      if (observerTarget.current) observer.unobserve(observerTarget.current)
+    }
+  }, [hasMore, loading, offset, folderPath])
 
   useEffect(() => {
     function handleClickOutside(e) {
@@ -164,12 +182,23 @@ export default function Browser() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  async function loadFiles() {
-    setLoading(true)
-    const d = await getFiles(bucket, folderPath)
-    setFiles(d.files || [])
-    setFolders(d.folders || [])
-    setChecked(new Set())
+  async function loadFiles(reset = true) {
+    if (reset) {
+      setLoading(true)
+      setOffset(0)
+    }
+    const currentOffset = reset ? 0 : offset
+    const d = await getFiles(bucket, folderPath, 50, currentOffset)
+    
+    if (reset) {
+      setFiles(d.files || [])
+      setFolders(d.folders || [])
+      setChecked(new Set())
+    } else {
+      setFiles(prev => [...prev, ...(d.files || [])])
+    }
+    setOffset(currentOffset + 50)
+    setHasMore((d.files || []).length === 50)
     setLoading(false)
   }
 
@@ -271,7 +300,7 @@ export default function Browser() {
     const d = await uploadFile(bucket, file, folderPath)
     if (d.error) showToast(d.error, 'error')
     else showToast('Uploaded ' + d.name, 'success')
-    loadFiles()
+    loadFiles(true)
     e.target.value = ''
   }
 
@@ -281,7 +310,7 @@ export default function Browser() {
       if (d.error) showToast(d.error, 'error')
     }
     showToast('Upload complete', 'success')
-    loadFiles()
+    loadFiles(true)
   }
 
   async function handleDownload(id) {
@@ -298,21 +327,21 @@ export default function Browser() {
   async function handleDelete(id) {
     if (!confirm('Delete this file?')) return
     const d = await deleteFile(bucket, id)
-    if (d.ok) { showToast('Deleted', 'success'); loadFiles() }
+    if (d.ok) { showToast('Deleted', 'success'); loadFiles(true) }
     else showToast(d.error, 'error')
   }
 
   async function handleFolderDelete(path) {
     if (!confirm('Delete folder and all contents?')) return
     const d = await deleteFolder(bucket, path)
-    if (d.ok) { showToast('Folder deleted', 'success'); loadFiles() }
+    if (d.ok) { showToast('Folder deleted', 'success'); loadFiles(true) }
     else showToast(d.error, 'error')
   }
 
   async function handleRename() {
     if (!renameValue.trim() || !renameTarget) return
     const d = await renameFile(bucket, renameTarget.id, renameValue.trim())
-    if (d.ok) { showToast('Renamed', 'success'); loadFiles() }
+    if (d.ok) { showToast('Renamed', 'success'); loadFiles(true) }
     else showToast(d.error, 'error')
     setRenameTarget(null); setRenameValue('')
   }
@@ -322,7 +351,7 @@ export default function Browser() {
     if (!newFolderName.trim()) return
     const path = (folderPath === '/' ? '/' : folderPath + '/') + newFolderName.trim()
     const d = await createFolder(bucket, path)
-    if (d.ok) { showToast('Folder created', 'success'); loadFiles() }
+    if (d.ok) { showToast('Folder created', 'success'); loadFiles(true) }
     else showToast(d.error, 'error')
     setShowFolderModal(false); setNewFolderName('')
   }
@@ -762,6 +791,12 @@ export default function Browser() {
                         </div>
                       </div>
                     )}
+                    {/* Infinite scroll observer target */}
+                    {hasMore && (
+                      <div ref={observerTarget} className="flex justify-center py-4">
+                        <Icon name="spinner" size={24} className="animate-spin text-gray-400" />
+                      </div>
+                    )}
                   </div>
                 ) : (
                   /* List view details table */
@@ -792,7 +827,7 @@ export default function Browser() {
                               <FileIcon name={f.name} isFolder size={22} />
                             </td>
                             <td className="px-3 py-3.5 text-sm text-gray-700 dark:text-gray-200 font-medium truncate max-w-[200px] sm:max-w-none">{f.name}</td>
-                            <td className="px-3 py-3.5 text-xs text-gray-400 dark:text-gray-500 hidden sm:table-cell">—</td>
+                            <td className="px-3 py-3.5 text-xs text-gray-400 dark:text-gray-500 hidden sm:table-cell">{f.size !== undefined ? fmtSize(f.size) : '—'}</td>
                             <td className="px-3 py-3.5 text-xs text-gray-400 dark:text-gray-500 hidden md:table-cell">{fmtDate(f.created_at)}</td>
                             <td className="px-3 py-3.5 text-right">
                               <button
@@ -844,6 +879,12 @@ export default function Browser() {
                         ))}
                       </tbody>
                     </table>
+                    {/* Infinite scroll observer target for list view */}
+                    {hasMore && (
+                      <div ref={observerTarget} className="flex justify-center py-4">
+                        <Icon name="spinner" size={24} className="animate-spin text-gray-400" />
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
